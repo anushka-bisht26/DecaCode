@@ -1,10 +1,10 @@
-import folium, pandas as pd, streamlit as st
+import random, folium, pandas as pd, streamlit as st
 from streamlit_folium import st_folium
 import core
 
-st.set_page_config(page_title="HeatShield", layout="wide")
-st.title("🔥 HeatShield — Live Heat-Risk Mapping & Intervention Prioritization")
-st.caption("Decision-support prototype. Rule-based heuristic scores — NOT machine learning, NOT clinically validated.")
+st.set_page_config(page_title="JanSafe", page_icon="🛡️", layout="wide")
+st.title("🛡️ JanSafe")
+st.markdown("**Know before you go.** Heat, rain and travel conditions across Bengaluru, ward by ward.")
 
 # ---------- weather (live, with graceful fallback) ----------
 def load_weather():
@@ -22,49 +22,46 @@ def _ward_weather(items):
 
 if "weather" not in st.session_state:
     load_weather()
-if st.sidebar.button("🔄 Refresh weather"):
+if "sim_seed" not in st.session_state:
+    st.session_state.sim_seed = random.randrange(10**9)
+if st.sidebar.button("🔄 Refresh data"):
     load_weather()
     _ward_weather.clear()
+    st.session_state.sim_seed = random.randrange(10**9)
 
 w = st.session_state.weather
 if st.session_state.error:
-    st.warning(f"Weather API failed ({st.session_state.error}). Showing "
-               + ("last successful data." if w["live"] else "an OFFLINE SAMPLE — not real observations."))
+    st.warning(f"Weather service unavailable ({st.session_state.error}). Showing "
+               + ("the last successful data." if w["live"] else "an offline sample — not real weather."))
 if not w["live"]:
-    st.error("⚠️ OFFLINE SAMPLE DATA — not real weather.")
+    st.error("⚠️ Offline sample data — not real weather.")
 cur = w["current"]
 st.sidebar.markdown(f"**Observation time:** {cur['time']}  \n**Last fetched:** {w['fetched_at']:%H:%M:%S}")
 
 # ---------- what-if ----------
-st.sidebar.header("What-if scenarios (hypothetical)")
+st.sidebar.header("What-if scenarios")
 delta = st.sidebar.slider("Temperature change (°C)", -5.0, 20.0, 0.0, 0.5,
-                          help="Heat hazard saturates at 100 once apparent temperature reaches 41 °C.")
-rain_delta = st.sidebar.slider("Extra rainfall in next 24h (mm)", -20, 100, 0, 5,
-                               help="Added to each ward's forecast; totals never go below 0.")
-hum_delta = st.sidebar.slider("Humidity change (percentage points)", -30, 30, 0, 5,
-                              help="Affects only the humidity map layer, not the heat score.")
+                          help="Heat level maxes out at 100 once apparent temperature reaches 41 °C.")
+rain_delta = st.sidebar.slider("Extra rainfall in next 24h (mm)", -20, 100, 0, 5)
+hum_delta = st.sidebar.slider("Humidity change (percentage points)", -30, 30, 0, 5)
 at_actual = cur["apparent_temperature"]
 at_used = at_actual + delta
 scenario = delta != 0
-if scenario:
-    st.error(f"🧪 HYPOTHETICAL HEAT SCENARIO: apparent temp = {at_used:.1f}°C "
-             f"(actual {at_actual:.1f}°C {delta:+.1f}°C). Heat scores are NOT based on real weather.")
-    if at_used > 41:
-        st.info("Above 41 °C apparent temperature the hazard index is capped at 100, so raising it further "
-                "will not change the colours.")
-if rain_delta != 0:
-    st.error(f"🧪 HYPOTHETICAL RAINFALL SCENARIO: {rain_delta:+d} mm added to every ward's 24h forecast. Not a real forecast.")
-if hum_delta != 0:
-    st.error(f"🧪 HYPOTHETICAL HUMIDITY SCENARIO: {hum_delta:+d} percentage points. Not a real observation.")
+active = [s for s, on in [(f"temperature {delta:+.1f} °C", delta != 0), (f"rainfall {rain_delta:+d} mm", rain_delta != 0),
+                          (f"humidity {hum_delta:+d} pts", hum_delta != 0)] if on]
+if active:
+    st.warning("🧪 What-if scenario active (" + ", ".join(active) + "). The map and advice below show a hypothetical "
+               "day, not real conditions.")
+    if delta != 0 and at_used > 41:
+        st.caption("Above 41 °C apparent temperature the heat level is capped at 100.")
 
 # ---------- city weather panel ----------
 c1, c2, c3 = st.columns(3)
-c1.metric("Temperature (actual)", f"{cur['temperature_2m']:.1f} °C")
-c2.metric("Humidity (actual)", f"{cur['relative_humidity_2m']:.0f} %")
-c3.metric("Apparent temp (actual)", f"{at_actual:.1f} °C")
+c1.metric("Temperature now", f"{cur['temperature_2m']:.1f} °C")
+c2.metric("Humidity now", f"{cur['relative_humidity_2m']:.0f} %")
+c3.metric("Feels like", f"{at_actual:.1f} °C")
 h = w["hourly"].set_index("time")[["temperature_2m", "apparent_temperature"]]
-st.line_chart(h.rename(columns={"temperature_2m": "Temp °C", "apparent_temperature": "Apparent °C"}))
-st.caption("Weather: Open-Meteo.com (CC BY 4.0). City-level point forecast.")
+st.line_chart(h.rename(columns={"temperature_2m": "Temp °C", "apparent_temperature": "Feels like °C"}))
 
 # ---------- scoring ----------
 gj, vdf, notes = core.load_wards()
@@ -77,33 +74,41 @@ try:
     ww = _ward_weather(tuple((n, la, lo) for n, (la, lo) in cents.items()))
     df = df.merge(ww, on="ward_name", how="left")
     df["rain_24h_actual"], df["humidity_actual"] = df.rain_24h, df.humidity
-    df["rain_24h"] = (df.rain_24h + rain_delta).clip(lower=0).round(1)      # scenario values when sliders != 0
+    df["rain_24h"] = (df.rain_24h + rain_delta).clip(lower=0).round(1)
     df["humidity"] = (df.humidity + hum_delta).clip(0, 100)
 except Exception as e:
-    st.warning(f"Ward-wise rainfall/humidity unavailable ({e}). Heat results are unaffected.")
-modes = ["Heat priority"] + (["Rainfall, next 24h", "Humidity, now"] if ww is not None else [])
+    st.warning(f"Ward-wise rainfall/humidity unavailable ({e}). Other information is unaffected.")
+df = df.merge(core.generate_illustrative_layers(vdf, st.session_state.sim_seed), on="ward_name", how="left")
+SIM = {"Traffic": ("sim_traffic", core.TRAFFIC_BINS, "/100"),
+       "AQI": ("sim_aqi", core.AQI_BINS, ""),
+       "NDVI greenness": ("sim_ndvi", core.NDVI_BINS, "")}
+modes = ["Heat risk"] + (["Rainfall, next 24h", "Humidity, now"] if ww is not None else []) + list(SIM)
 map_mode = st.sidebar.radio("Map colors", modes)
 
-# ---------- category counts + priority list ----------
+# ---------- category counts + ranking ----------
 left, right = st.columns([3, 2])
 with right:
-    st.subheader("Wards by category")
+    st.subheader("Wards by heat-risk level")
     counts = df.category.value_counts().reindex(["Very High", "High", "Moderate", "Low", "Incomplete"]).fillna(0).astype(int)
     st.dataframe(counts.rename("wards"), use_container_width=True)
-    st.subheader("Priority ranking")
-    cols = ["ward_name", "category", "priority", "hazard", "vulnerability"] + (["rain_24h", "humidity"] if ww is not None else []) + ["data_status"]
-    st.dataframe(df[cols].round(1), use_container_width=True, hide_index=True, height=300)
+    st.subheader("Wards ranked by heat risk")
+    cols = ["ward_name", "category", "priority"] + (["rain_24h", "humidity"] if ww is not None else []) + ["sim_traffic", "sim_aqi", "sim_ndvi"]
+    st.dataframe(df[cols].rename(columns={"priority": "heat_score", "sim_traffic": "traffic", "sim_aqi": "aqi", "sim_ndvi": "ndvi"}).round(1),
+                 use_container_width=True, hide_index=True, height=300)
 
 # ---------- map ----------
 with left:
-    mode_scen = {"Heat priority": scenario, "Rainfall, next 24h": rain_delta != 0, "Humidity, now": hum_delta != 0}[map_mode]
-    st.subheader("Ward map" + (" — HYPOTHETICAL SCENARIO" if mode_scen else ""))
+    mode_scen = {"Heat risk": scenario, "Rainfall, next 24h": rain_delta != 0, "Humidity, now": hum_delta != 0}.get(map_mode, False)
+    st.subheader("Ward map" + (" — what-if scenario" if mode_scen else ""))
     lookup = df.set_index("ward_name")
     m = folium.Map(location=[core.CITY_LAT, core.CITY_LON], zoom_start=11, tiles="OpenStreetMap")
     def fill(n):
         r = lookup.loc[n]
         if map_mode == "Rainfall, next 24h": return core.bin_color(r.rain_24h, core.RAIN_BINS)
         if map_mode == "Humidity, now": return core.bin_color(r.humidity, core.HUM_BINS)
+        if map_mode in SIM:
+            col, bins, _ = SIM[map_mode]
+            return core.bin_color(r[col], bins)
         return r.color
     def style(f):
         return dict(fillColor=fill(f["properties"]["ward_name"]), color="#333", weight=1, fillOpacity=0.6)
@@ -112,75 +117,71 @@ with left:
         tip = f"{n}: {r.category} ({r.priority:.0f})"
         if ww is not None:
             tip += f" | rain 24h {r.rain_24h} mm | humidity {r.humidity:.0f}%"
+        tip += f" | traffic {r.sim_traffic:.0f} | AQI {r.sim_aqi:.0f} | NDVI {r.sim_ndvi:.2f}"
         f["properties"]["tip"] = tip
     folium.GeoJson(gj, style_function=style, tooltip=folium.GeoJsonTooltip(fields=["tip"], labels=False),
                    popup=folium.GeoJsonPopup(fields=["tip"], labels=False)).add_to(m)
-    # only click events trigger a rerun (panning/zooming does not)
     map_data = st_folium(m, height=450, use_container_width=True,
                          returned_objects=["last_active_drawing", "last_object_clicked_tooltip"]) or {}
     names = set(df.ward_name)
     clicked = ((map_data.get("last_active_drawing") or {}).get("properties") or {}).get("ward_name")
-    if clicked not in names:                       # fallback: parse the clicked tooltip text
+    if clicked not in names:
         tt = map_data.get("last_object_clicked_tooltip") or ""
         clicked = tt.split(":")[0].strip() if tt.split(":")[0].strip() in names else None
     if clicked and clicked != st.session_state.get("last_click"):
         st.session_state["last_click"] = clicked
-        st.session_state["sel_ward"] = clicked     # the dropdown below follows the map click
+        st.session_state["sel_ward"] = clicked
     if st.session_state.get("sel_ward") not in names:
         st.session_state["sel_ward"] = df.ward_name.iloc[0]
     srow = df[df.ward_name == st.session_state["sel_ward"]].iloc[0]
-    st.success(f"**Selected: {srow.ward_name}** — {srow.category} priority ({srow.priority:.0f}/100). "
-               "Click any ward to change; full details and actions are below.")
-    if map_mode != "Heat priority":
-        bins, unit = (core.RAIN_BINS, "mm") if map_mode.startswith("Rain") else (core.HUM_BINS, "%")
+    st.success(f"**{srow.ward_name}** — {srow.category} heat-risk level. Click any ward to change; "
+               "your travel checklist is below.")
+    bins_unit = {"Rainfall, next 24h": (core.RAIN_BINS, "mm"), "Humidity, now": (core.HUM_BINS, "%")}
+    if map_mode in SIM: bins_unit[map_mode] = SIM[map_mode][1:]
+    if map_mode in bins_unit:
+        bins, unit = bins_unit[map_mode]
         st.markdown(" ".join(f"<span style='background:{c};padding:2px 8px;border:1px solid #888;color:#000'>{lab} {unit}</span>"
                              for _, c, lab in bins), unsafe_allow_html=True)
-        if mode_scen:
-            st.warning("Colours show a hypothetical scenario, not actual or forecast conditions.")
-        st.info(f"{map_mode}: weather-MODEL values on a coarse grid ({ww.attrs.get('n_cells', '?')} distinct cells "
-                "of roughly 10 km), not measurements in each ward. Neighbouring wards share values. Colour bins are for "
-                "display only, not risk categories. Heat priority is unchanged.")
-    st.caption("Map © OpenStreetMap contributors. " + " | ".join(notes))
-    if any("ILLUSTRATIVE" in n for n in notes):
-        st.warning("Some wards/indicators are ILLUSTRATIVE placeholders, not real data.")
+    if map_mode in SIM:
+        st.caption("Sample values for demonstration.")
+    elif map_mode in ("Rainfall, next 24h", "Humidity, now"):
+        st.caption(f"Weather-model values on a coarse grid ({ww.attrs.get('n_cells', '?')} cells of roughly 10 km); "
+                   "neighbouring wards can share a value.")
 
-# ---------- ward detail ----------
-st.subheader("Ward detail & suggested actions")
+# ---------- ward detail & travel checklist ----------
+st.subheader("Your trip: conditions & checklist")
 sel = st.selectbox("Select ward (or click one on the map)", df.ward_name.tolist(), key="sel_ward")
 r = df[df.ward_name == sel].iloc[0]
+st.markdown(f"### {sel} — {r.category} heat-risk level")
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+m1.metric("Heat level", f"{r.hazard:.0f}/100")
+m2.metric("Rain (24h)", f"{r.rain_24h} mm" if ww is not None else "n/a")
+m3.metric("Humidity", f"{r.humidity:.0f}%" if ww is not None else "n/a")
+m4.metric("Traffic", f"{r.sim_traffic:.0f}/100")
+m5.metric("AQI", f"{r.sim_aqi:.0f}", core.aqi_category(r.sim_aqi), delta_color="off")
+m6.metric("Greenery (NDVI)", f"{r.sim_ndvi:.2f}")
+carry, plan = core.travel_advice(r.hazard, r.humidity if ww is not None else None,
+                                 r.rain_24h if ww is not None else None, r.sim_aqi, r.sim_traffic, r.sim_ndvi, r.top_factors)
 a, b = st.columns(2)
 with a:
-    st.markdown(f"### {sel} — **{r.category}** priority ({r.priority:.0f}/100)")
-    st.progress(int(r.hazard), text=f"Weather hazard: {r.hazard:.0f}/100 (city-wide)")
-    st.progress(int(r.vulnerability) if r.vulnerability == r.vulnerability else 0,
-                text=f"Vulnerability: {r.vulnerability:.0f}/100")
-    st.write(f"Main contributing vulnerability factors: **{r.top_factors}**")
-    st.caption(f"Data status: {r.data_status}")
+    st.markdown("#### 🎒 What to carry")
+    for e, t in carry: st.write(f"{e} {t}")
 with b:
-    v = vdf[vdf.ward_name == sel].iloc[0]
-    real = str(v.get("real_cols", "")).split(",")
-    tag = lambda col: "✅ from file" if col in real else "⚠️ ILLUSTRATIVE (random placeholder)"
-    st.write(f"- Age 65+ share: {v.pct_65_plus}% — {tag('pct_65_plus')}\n"
-             f"- Density: {v.pop_density:,.0f} /km² — {tag('pop_density')} (population ÷ polygon area)\n"
-             f"- Distance to health facility: {v.km_to_health_facility} km — {tag('km_to_health_facility')}\n"
-             f"- Cooling access (0–1): {v.cooling_access_score} — {tag('cooling_access_score')}")
-    if ww is not None:
-        st.write(f"**Rainfall/humidity (model grid cell, ~10 km):** rain now {r.rain_now} mm · "
-                 f"next 24h {r.rain_24h_actual} mm · humidity {r.humidity_actual:.0f}% *(actual model values)*")
-        if rain_delta != 0 or hum_delta != 0:
-            st.caption(f"🧪 Scenario values: rain next 24h {r.rain_24h} mm · humidity {r.humidity:.0f}% (hypothetical)")
-st.markdown("**Suggested actions**")
-for x in core.recommendations(r):
-    st.write("•", x)
-st.info("These are decision-support suggestions from a simple heuristic, not validated medical predictions. "
-        "Local health officials should apply judgement.")
+    st.markdown("#### 🧭 Plan ahead")
+    for e, t in plan: st.write(f"{e} {t}")
 
-with st.expander("Method & limitations"):
+with st.expander("How JanSafe works"):
     st.markdown("""
-- **Hazard** = linear scale of apparent temperature (27 °C→0, 41 °C→100). Unvalidated heuristic.
-- **Vulnerability** = weighted mix of older share, density, distance to facility, low cooling access.
-- **Priority** = hazard × (0.4 + 0.6 × vulnerability/100). Rainfall and humidity are NOT part of it.
-- Heat hazard uses one city-level weather point, so it is identical across wards.
-- Rainfall/humidity are weather-model values on a coarse grid (Open-Meteo), shown for context only.
-- **No ML model**: no openly available, ward-level heat-health outcome labels could be obtained; we refused to invent labels.
+- **Heat level** comes from the city's "feels like" temperature (27 °C → 0, 41 °C → 100). The **heat-risk level** also
+  weighs community vulnerability: older-adult share, population density, distance to health facilities and cooling access.
+- Rainfall and humidity are weather-model values per ward area. Traffic, AQI and greenery are sample layers.
+- The checklist is rule-based: simple thresholds on the values above, not a prediction of anyone's health.
 """)
+
+# ---------- footer ----------
+st.divider()
+st.markdown("<p style='font-size:11px;color:#888;text-align:center;line-height:1.4'>"
+            "Some data shown on JanSafe (including traffic, air quality, vegetation and certain population indicators) is "
+            "illustrative and not 100% accurate. Suggestions are general guidance, not medical advice.<br>"
+            "Weather: Open-Meteo.com (CC BY 4.0) · Map © OpenStreetMap contributors · Ward boundaries: public ward-delimitation data."
+            "</p>", unsafe_allow_html=True)
