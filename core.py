@@ -1,4 +1,4 @@
-"""HeatShield core logic: weather fetch, ward data, hazard/vulnerability/priority scoring.
+"""JanSafe core logic: weather fetch, ward data, hazard/vulnerability/priority scoring.
 NOTE: Everything here is a transparent RULE-BASED heuristic. There is NO machine learning,
 and nothing is clinically validated."""
 import json, os
@@ -42,6 +42,32 @@ RAIN_BINS = [(0.5, "#f7fbff", "<0.5"), (2, "#c6dbef", "0.5–2"), (10, "#6baed6"
              (30, "#2171b5", "10–30"), (1e9, "#08306b", ">30")]          # mm in next 24h (display bins only)
 HUM_BINS = [(40, "#fff7bc", "<40"), (55, "#d9f0a3", "40–55"), (70, "#78c679", "55–70"),
             (85, "#238443", "70–85"), (101, "#004529", ">85")]            # % relative humidity (display bins only)
+
+TRAFFIC_BINS = [(20, "#ffffcc", "<20"), (40, "#fed976", "20–40"), (60, "#fd8d3c", "40–60"),
+                (80, "#e31a1c", "60–80"), (101, "#800026", ">80")]              # simulated congestion index 0-100
+AQI_BINS = [(51, "#2ecc71", "0–50"), (101, "#f1c40f", "51–100"), (151, "#e67e22", "101–150"),
+            (201, "#c0392b", "151–200"), (301, "#8e44ad", "201–300"), (10**6, "#5d0f1e", ">300")]   # US EPA band colours
+NDVI_BINS = [(0.2, "#a6611a", "<0.2"), (0.3, "#dfc27d", "0.2–0.3"), (0.4, "#c7e9b4", "0.3–0.4"),
+             (0.5, "#41ab5d", "0.4–0.5"), (2, "#006d2c", ">0.5")]              # simulated vegetation greenness
+
+def aqi_category(v):
+    for lim, name in [(50, "Good"), (100, "Moderate"), (150, "Unhealthy for sensitive groups"),
+                      (200, "Unhealthy"), (300, "Very unhealthy")]:
+        if v <= lim: return name
+    return "Hazardous"
+
+def generate_illustrative_layers(vdf, seed):
+    """SIMULATED traffic, AQI and NDVI per ward. Pure random numbers (loosely nudged by population density so
+    they look plausible). NOT measurements; changes whenever the seed changes."""
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    n = len(vdf)
+    d = (vdf.pop_density.fillna(vdf.pop_density.median()) / 40000).clip(0, 1).values
+    traffic = np.clip(25 + 40 * d + rng.normal(0, 14, n), 3, 98)
+    aqi = np.clip(55 + 70 * d + rng.normal(0, 28, n), 20, 260)
+    ndvi = np.clip(0.52 - 0.30 * d + rng.normal(0, 0.09, n), 0.04, 0.75)
+    return pd.DataFrame(dict(ward_name=vdf.ward_name.values, sim_traffic=traffic.round(0),
+                             sim_aqi=aqi.round(0), sim_ndvi=ndvi.round(2)))
 
 def bin_color(v, bins):
     if v is None or pd.isna(v): return "#95a5a6"
@@ -186,19 +212,46 @@ def score_wards(vdf, apparent_c):
     df["top_factors"] = comp.apply(lambda r: ", ".join(r.sort_values(ascending=False).index[:2]), axis=1)
     return df.sort_values("priority", ascending=False).reset_index(drop=True), comp
 
-def recommendations(row):
-    recs = []
-    if row.category in ("High", "Very High"):
-        recs += ["Issue a targeted heat advisory (SMS / local loudspeaker / ward WhatsApp groups).",
-                 "Set up temporary drinking-water points and shaded rest areas."]
-    if row.category == "Very High":
-        recs.append("Prioritise this ward for outreach teams this afternoon.")
-    if "Older-adult" in row.top_factors:
-        recs.append("Ask ASHA/community workers to check on older residents living alone.")
-    if "cooling" in row.top_factors:
-        recs.append("Open public cooling spaces (community halls, libraries) during peak hours.")
-    if "health facility" in row.top_factors:
-        recs.append("Alert the nearest clinic and pre-position ORS and first-aid supplies.")
-    if not recs:
-        recs.append("Routine monitoring; share general hydration advice.")
-    return recs
+def travel_advice(hazard, humidity, rain_24h, aqi, traffic, ndvi, top_factors=""):
+    """Individual, rule-based travel suggestions from the values shown on the map.
+    Returns (carry, plan) as lists of (emoji, text). General guidance only."""
+    ok = lambda x: x is not None and not pd.isna(x)
+    carry, plan = [], []
+    if ok(hazard):
+        if hazard >= 30:
+            carry += [("🧢", "Cap or hat"), ("💧", "Water bottle — sip regularly, refill when you can")]
+        if hazard >= 50:
+            carry += [("🕶️", "Sunglasses"), ("🧴", "Sunscreen"), ("👕", "Light, loose cotton clothes")]
+        if hazard >= 75:
+            carry += [("🥤", "ORS or electrolyte sachets")]
+            plan += [("🕛", "Avoid being outdoors in the hottest hours (around midday to late afternoon) if you can"),
+                     ("❄️", "Plan stops in shade or air-conditioned places")]
+        if hazard >= 30 and ok(humidity) and humidity >= 70:
+            carry.append(("🧻", "Small towel or handkerchief — humid air makes heat feel worse"))
+    if ok(rain_24h):
+        if rain_24h >= 2:
+            carry.append(("☔", "Umbrella or light raincoat"))
+        if rain_24h >= 10:
+            carry += [("🎒", "Waterproof cover for your bag and phone"), ("👟", "Footwear with good grip")]
+            plan.append(("🌊", "Expect waterlogged stretches — check your route before leaving and avoid underpasses"))
+        if rain_24h >= 30:
+            plan.append(("⛔", "Very heavy rain expected — postpone non-essential travel"))
+    if ok(aqi):
+        if aqi >= 101:
+            carry += [("😷", "Mask (N95/FFP2 type)"),
+                      ("💊", "Inhaler or regular medicines if you have asthma, heart or lung conditions")]
+        if aqi >= 151:
+            plan.append(("🏠", "Limit time outdoors and avoid strenuous activity"))
+    if ok(traffic):
+        if traffic >= 60:
+            plan += [("🚦", "Expect delays — leave early"), ("🔋", "Charge your phone / carry a power bank")]
+        if traffic >= 80:
+            plan.append(("🚇", "Consider the metro or travelling off-peak"))
+    if ok(ndvi) and ndvi < 0.25:
+        plan.append(("🌳", "Few trees in this area — plan shade or indoor breaks"))
+    if "Older-adult" in str(top_factors):
+        plan.append(("👵", "Travelling with older relatives or children? Add rest stops and extra water"))
+    if not carry and not plan:
+        carry = [("💧", "Water bottle"), ("📱", "Charged phone")]
+        plan = [("✅", "Conditions look comfortable for travel right now")]
+    return carry, plan
